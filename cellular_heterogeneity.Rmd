@@ -1,0 +1,377 @@
+---
+title: "Cellular heterogeneity in disease | Analysis walkthrough | ISC 2019"
+output: html_document
+---
+
+Adapted from the course material provided by the Institute for Systems Biology, Seattle, Washington, USA. 
+
+### 0. Lodading libraries
+Load required libraries.
+
+```{r, warning=FALSE}
+# 0.1. Load required packages for today
+library(RColorBrewer)   # 1. library to access easily multiple colors for plotting
+library(Rtsne)          # 2. R implementation of the t-SNE algorithm
+library(tictoc)         # 3. library to profile execution time
+library(Seurat)         # 4. library to single-cell analysis
+library(magrittr)       # 5. library for introducing pipe syntax: https://cran.r-project.org/web/packages/magrittr/vignettes/magrittr.html
+library(dplyr)          # 6. useful to manipulate data frames
+```
+
+# 1. Biomarker discovery
+Working on the [guided clustering tutorial](https://satijalab.org/seurat/v3.0/pbmc3k_tutorial.html) from Seurat.
+
+## 1.0. Load data PBMC data
+We are analyzing a very commonly used dataset of peripheral blood mononuclear cells (PBMC) freely available from 10X Genomics. The experiment yield 2,700 single cell transcriptomes, sequenced on the Illumina NextSeq 500. Data originally retrieved from [here](https://s3-us-west-2.amazonaws.com/10x.files/samples/cell/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz).
+Originally retrieved from: https://s3-us-west-2.amazonaws.com/10x.files/samples/cell/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz
+
+Once the tar file is downloaded, you can use the following command to load the data into R:
+```
+pbmc.data=Read10X(data.dir="~/scratch/filtered_gene_bc_matrices/hg19/")
+```
+We then saved the data into and R object for convenient loading in this course using the command:
+```
+save(pbmc.data, file = "~/scratch/pbmc.RData")
+```
+So now, let's load the data and start the exploration!
+```{r}
+load("data/pbmc.RData") 
+```
+
+## 1.1. Initialize a Seurat object 
+Initialize the Seurat object with the raw (non-normalized data). Keep all genes expressed in >= 3 cells (~0.1% of the data). Keep all cells with at least 200 detected genes.
+```{r}
+pbmc <- CreateSeuratObject(counts = pbmc.data, project = "pbmc3k", min.cells = 3, min.features = 200)
+pbmc
+```
+
+## 1.2. Quality control
+In addition to the number of genes detected, the community typically filters out cells with high percentage of mapping reads to the mitochondrial genome. 
+This is due to low-quality / dying cells often exhibit extensive mitochondrial contamination. Mitochondrial QC metrics are computed with the `PercentageFeatureSet` function, which calculates the percentage of counts originating from a set of features (mitochondrial genes). All genes starting with MT- as a set of mitochondrial genes
+
+Info: The `[[` operator can add columns to object metadata. This is a great place to stash QC stats.
+
+```{r}
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+```
+
+Visualize QC metrics as a violin plot.
+```{r}
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+`FeatureScatter` is typically used to visualize feature-feature relationships, but can be used for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+```{r}
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+CombinePlots(plots = list(plot1, plot2))
+```
+
+Let's get the high quality transcriptomes by filtering out cells that have unique gene counts over 2,500 or less than 200 genes.
+```{r}
+pbmc <- subset(pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+```
+
+## 1.3. Data normalization
+We can normalize expression data by a global-scaling normalization method `LogNormalize` that normalizes the feature expression measurements for each cell by the total expression, multiplies this by a scale factor (10,000 by default), and log-transforms the result.
+```{r}
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+## 1.4. Feature selection
+Next, we will retrieve genes with high cell-to-cell variation across the data set. In this case we will consider both. Focusing on these genes in downstream analysis helps to highlight biological signal in single-cell datasets.
+
+Let's use the `FindVariableFeatures` function that directly models the mean-variance relationship inherent in single-cell data.
+```{r}
+pbmc <- FindVariableFeatures(pbmc, selection.method = "vst", nfeatures = 2000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+
+# plot variable features with and without labels
+plot1=VariableFeaturePlot(pbmc)
+LabelPoints(plot = plot1, points = top10, repel = TRUE)
+```
+
+## 1.4 Scale the data
+
+```{r}
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes)
+```
+
+## 1.5 Perform linear dimensional reduction
+
+```{r}
+pbmc <- RunPCA(pbmc, features = VariableFeatures(object = pbmc))
+```
+
+
+Visualize PC loadings.
+```{r}
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+```
+
+Visualize cells in the first two PCs.
+```{r}
+DimPlot(pbmc, reduction = "pca")
+```
+
+Heatmap of expression for the 15 genes with stronger loadings.
+```{r}
+DimHeatmap(pbmc, dims = 1, cells = 500, balanced = TRUE)
+```
+
+Iterate heatmap visualization across 10 components.
+```{r}
+DimHeatmap(pbmc, dims = 1:9, cells = 500, balanced = TRUE)
+```
+
+## 1.6. Determine the ‘dimensionality’ of the dataset
+# 1.6.1. Elbow approach
+```{r}
+ElbowPlot(pbmc)
+```
+
+## 1.7. Cluster cells
+```{r}
+pbmc <- FindNeighbors(pbmc, dims = 1:10)
+pbmc <- FindClusters(pbmc, resolution = 0.5)
+```
+
+# Visualize clusters
+We can use UMAP to perform dimensionality reduction.
+```{r}
+# if RunUMAP fails, most likely it is because UMAP is missing. Run the command line "pip install umap-learn" in a your termina and try again
+pbmc <- RunUMAP(pbmc, dims = 1:10)
+DimPlot(pbmc, reduction = "umap")
+# alternatively, we can use t-SNE
+#pbmc=RunTSNE(pbmc,dims=1:25)
+#TSNEPlot(pbmc) # add file='figure.pdf' if you have some Quartz related errors.
+```
+
+## 1.8. Find cluster biomarkers
+Find all markers of cluster 1.
+```{r}
+cluster1.markers <- FindMarkers(pbmc, ident.1 = 1, min.pct = 0.25)
+head(cluster1.markers, n = 5)
+```
+
+Find all markers distinguishing cluster 5 from clusters 0 and 3
+```{r}
+cluster5.markers <- FindMarkers(pbmc, ident.1 = 5, ident.2 = c(0, 3), min.pct = 0.25)
+head(cluster5.markers, n = 5)
+```
+
+
+Find markers for every cluster compared to all remaining cells, report only the positive ones
+```{r}
+pbmc.markers <- FindAllMarkers(pbmc, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+pbmc.markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_logFC)
+```
+
+The ROC test returns the ‘classification power’ for any individual marker (ranging from 0 - random, to 1 - perfect).
+
+```{r}
+cluster1.markers <- FindMarkers(pbmc, ident.1 = 0, logfc.threshold = 0.25, test.use = "roc", only.pos = TRUE)
+head(cluster1.markers)
+```
+
+Visualize markers expression distributions.
+```{r}
+VlnPlot(pbmc, features = c("MS4A1", "CD79A"))
+```
+
+Visualize markers expression distributions using raw counts.
+```{r}
+VlnPlot(pbmc, features = c("MS4A1", "CD79A"),slot = "counts", log = TRUE)
+```
+
+Visualize markers expression in the embedded space.
+```{r}
+#FeaturePlot(pbmc,features = c("MS4A1", "GNLY", "CD3E", "CD14", "FCER1A", "FCGR3A", "LYZ", "PPBP", "CD8A"))
+FeaturePlot(pbmc,features = c("LDHB", "LTB", "S100A9", "CD79A", "CCL5", "FCGR3A", "GZMB", "FCER1A","PF4"))
+```
+
+Visualize markers as a heatmap
+```{r}
+top10 <- pbmc.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_logFC)
+DoHeatmap(pbmc, features = top10$gene) + NoLegend()
+```
+
+
+Using literature we can associate a cell type to identified clusters via gene markers.
+```{r}
+new.cluster.ids <- c("Naive CD4 T", "Memory CD4 T", "CD14+ Mono", "B", "CD8 T", "FCGR3A+ Mono", 
+    "NK", "DC", "Platelet")
+names(new.cluster.ids) <- levels(pbmc)
+pbmc <- RenameIdents(pbmc, new.cluster.ids)
+DimPlot(pbmc, reduction = "umap", label = TRUE, pt.size = 0.5,file='figure.final.pdf') + NoLegend()
+```
+
+## 2.0. Load expression data
+This expression data, as the ones you will be working with, they are already pre-processed. No need to filter for mitochondrial counts.
+```{r, load expression data}
+load("data/malignantCells.2k.RData")
+str(malignantCellsExpression[1:5,1:5])
+```
+
+## 2.1. PCA
+```{r, PCA}
+results=prcomp(malignantCellsExpression)
+plot(results$x[,'PC1'],results$x[,'PC2'],main='PCA of malignant cells',pch=19,xlab='PC 1',ylab='PC 2')
+```
+
+Associate patient metadata to plotting colors.
+```{r, add colors}
+plottingColors=brewer.pal(length(unique(malignantCellsPatientMetadata)),'Dark2')
+names(plottingColors)=unique(malignantCellsPatientMetadata)
+```
+
+Inspect variables.
+```{r, inspect variables}
+str(malignantCellsPatientMetadata)
+str(unique(malignantCellsPatientMetadata))
+str(plottingColors)
+str(plottingColors[malignantCellsPatientMetadata])
+```
+
+Plot again with patient metadata as different colors.
+```{r}
+plot(results$x[,'PC1'],results$x[,'PC2'],main='PCA of malignant cells',col=plottingColors[malignantCellsPatientMetadata],pch=19,xlab='PC 1',ylab='PC 2')
+legend('bottomright',legend=unique(malignantCellsPatientMetadata),fill=plottingColors)
+```
+
+## 2.2. tSNE 
+```{r}
+results2D=Rtsne(malignantCellsExpression,dims=2,perplexity=50,theta=0)
+plot(results2D$Y,main='tSNE of malignant cells, p=50',col=plottingColors[malignantCellsPatientMetadata],pch=19,xlab='tSNE Component 1',ylab='tSNE Component 2')
+legend('topright',legend=unique(malignantCellsPatientMetadata),fill=plottingColors)
+```
+
+## 3.0. Load melanoma data sets
+
+We now look at single-cell RNA-Seq data from malignant and non-malignant melanoma cells.
+```{r}
+load("data/malignantCells.2k.RData")
+str(malignantCellsExpression[1:5,1:5])
+
+load("data/nonMalignantCells.2k.RData")
+str(nonMalignantCellsExpression[1:5,1:5])
+```
+
+## 3.1. PCA -- malignant cells
+```{r}
+results=prcomp(malignantCellsExpression)
+plot(results$x[,'PC1'],results$x[,'PC2'],main='PCA of malignant cells',pch=19,xlab='PC 1',ylab='PC 2')
+
+plottingColors=brewer.pal(length(unique(malignantCellsPatientMetadata)),'Dark2')
+names(plottingColors)=unique(malignantCellsPatientMetadata)
+
+str(malignantCellsPatientMetadata)
+str(unique(malignantCellsPatientMetadata))
+str(plottingColors)
+str(plottingColors[malignantCellsPatientMetadata])
+
+plot(results$x[,'PC1'],results$x[,'PC2'],main='PCA of malignant cells',col=plottingColors[malignantCellsPatientMetadata],pch=19,xlab='PC 1',ylab='PC 2')
+legend('bottomright',legend=unique(malignantCellsPatientMetadata),fill=plottingColors)
+```
+
+## 3.2. tSNE -- malignant cells
+```{r}
+results2D=Rtsne(malignantCellsExpression,dims=2,perplexity=50,theta=0)
+plot(results2D$Y,main='tSNE of malignant cells, p=50',col=plottingColors[malignantCellsPatientMetadata],pch=19,xlab='tSNE Component 1',ylab='tSNE Component 2')
+legend('topright',legend=unique(malignantCellsPatientMetadata),fill=plottingColors)
+```
+
+## 3.3. PCA -- non-malignant cells
+```{r}
+results.n=prcomp(nonMalignantCellsExpression)
+plot(results.n$x[,'PC1'],results.n$x[,'PC2'],main='PCA of non-malignant cells',pch=19,xlab='PC 1',ylab='PC 2')
+
+plottingColors=brewer.pal(length(unique(tumorLabels)),'Dark2')
+names(plottingColors)=unique(tumorLabels)
+
+plottingColorsImmune=brewer.pal(length(unique(immuneLabels)),'Dark2')
+names(plottingColorsImmune)=unique(immuneLabels)
+
+plot(results.n$x[,'PC1'],results.n$x[,'PC2'],main='PCA of non-malignant cells',col=plottingColorsImmune[immuneLabels],pch=19,xlab='PC 1',ylab='PC 2')
+legend('bottomright',legend=unique(immuneLabels),fill=plottingColorsImmune)
+```
+
+## 3.3. tSNE -- non-malignant cells
+```{r}
+# cluster by patients
+results2D.n=Rtsne(nonMalignantCellsExpression,dims=2,perplexity=50,theta=0)
+plot(results2D.n$Y,main='tSNE of non-malignant cells, p=50',col=plottingColors[tumorLabels],pch=19,xlab='tSNE Component 1',ylab='tSNE Component 2')
+legend('topright',legend=unique(tumorLabels),fill=plottingColors)
+
+# cluster by cell type
+results2D.n=Rtsne(nonMalignantCellsExpression,dims=2,perplexity=50,theta=0)
+plot(results2D.n$Y,main='tSNE of non-malignant cells, p=50',col=plottingColorsImmune[immuneLabels],pch=19,xlab='tSNE Component 1',ylab='tSNE Component 2')
+legend('topright',legend=unique(immuneLabels),fill=plottingColorsImmune, bty='n')
+
+results2D.n=Rtsne(nonMalignantCellsExpression,dims=2,perplexity=10,theta=0)
+plot(results2D.n$Y,main='tSNE of non-malignant cells, p=10',col=plottingColorsImmune[immuneLabels],pch=19,xlab='tSNE Component 1',ylab='tSNE Component 2')
+legend('topright',legend=unique(immuneLabels),fill=plottingColorsImmune, bty='n')
+
+results2D.n=Rtsne(nonMalignantCellsExpression,dims=2,perplexity=100,theta=0)
+plot(results2D.n$Y,main='tSNE of non-malignant cells, p=100',col=plottingColorsImmune[immuneLabels],pch=19,xlab='tSNE Component 1',ylab='tSNE Component 2')
+legend('topright',legend=unique(immuneLabels),fill=plottingColorsImmune, bty='n')
+
+```
+## 3.4. Using Seurat
+
+```{r}
+nmce <- CreateSeuratObject(counts = t(nonMalignantCellsExpression), project = "nmce", min.cells = 3, min.features = 200)
+
+nmce <- AddMetaData(nmce,immuneLabels,col.name="Immune")
+
+FeatureScatter(nmce, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",ylim=c(0,5000))
+nmce <- subset(nmce, subset = nFeature_RNA > 300 & nFeature_RNA < 1500)
+
+nmce <- FindVariableFeatures(nmce, selection.method = "vst", nfeatures = 1000)
+top10 <- head(VariableFeatures(nmce), 10)
+
+nmce <- NormalizeData(nmce, normalization.method = "LogNormalize", scale.factor = 10000)
+nmce <- ScaleData(nmce, features = rownames(nmce))
+
+nmce.pca <- RunPCA(nmce, features = VariableFeatures(object = nmce))
+VizDimLoadings(nmce.pca, dims = 1:2, reduction = "pca")
+
+pdf('nm_seurat_pca_immune.pdf')
+DimPlot(nmce.pca, reduction = "pca",group.by="Immune")
+dev.off()
+
+nmce.clust <- FindNeighbors(nmce.pca, dims = 1:10)
+nmce.clust <- FindClusters(nmce.clust, resolution = 0.5)
+
+nmce.clust <- RunUMAP(nmce.clust, dims = 1:10)
+pdf('nm_seurat_umap_immune.pdf')
+DimPlot(nmce.clust, reduction = "umap",group.by="Immune")
+dev.off()
+
+nmce.clust <- RunTSNE(nmce.clust, dims = 1:10)
+pdf('nm_seurat_tsne_immune.pdf')
+DimPlot(nmce.clust, reduction = "tsne",group.by="Immune")
+dev.off()
+
+pdf('nm_seurat_pca.pdf')
+DimPlot(nmce.clust, reduction = "pca")
+dev.off()
+
+cluster0.markers <- FindMarkers(nmce.clust, ident.1 = 0, min.pct = 0.25)
+cluster1.markers <- FindMarkers(nmce.clust, ident.1 = 1, min.pct = 0.25)
+cluster2.markers <- FindMarkers(nmce.clust, ident.1 = 2, min.pct = 0.25)
+cluster3.markers <- FindMarkers(nmce.clust, ident.1 = 3, min.pct = 0.25)
+cluster4.markers <- FindMarkers(nmce.clust, ident.1 = 4, min.pct = 0.25)
+cluster5.markers <- FindMarkers(nmce.clust, ident.1 = 5, min.pct = 0.25)
+
+
+head(cluster0.markers, n = 5)
+head(cluster1.markers, n = 5)
+head(cluster2.markers, n = 5)
+head(cluster3.markers, n = 5)
+head(cluster4.markers, n = 5)
+head(cluster5.markers, n = 5)
+```
