@@ -1,0 +1,520 @@
+---
+title: 'Disease classification'
+author: 
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+  
+Adapted from the course material provided by the Institute for Systems Biology, Seattle, Washington, USA.  
+
+## Preparation  
+  
+0.1 Install required R packages
+```{r Install required R packages}
+#source("install_dependencies_Day2.R") #only  needed once
+```
+
+0.2 Load libaries
+```{r Load libaries,MESSAGE=FALSE}
+library(randomForest)
+library(ROCR)
+library(MASS)
+library(ggplot2)
+library(class)
+library(Biobase)
+library(GEOquery)
+library(limma)
+library(rmarkdown)
+library(caret)
+```
+## 1 miRNA dataset
+
+1.1 Load miRNA dataset 
+```{r Load miRNA dataset}
+#clear all variables
+rm(list=ls())
+#load dataset
+load("data/blood_miRNA_expression_LUSC_vs_Normal.rda")
+#contains 400 training samples and 300 test samples for 109 miRNA, variable 110 is the 'status' 
+#or class label (0= normal, 1= cancer)
+
+## or parse it from the original files
+# # training data
+# d1 = read.csv('../data/blood_miRNA_expression_LUSC_vs_Normal.csv',header=T,row.names=1)
+# cn1 = c(rep(0,200),rep(1,200))
+# train = as.data.frame(t(rbind(d1,status=cn1)))
+# # test data
+# t1 = read.csv('data/validation_blood_miRNA_expression_LUSC_vs_Normal.csv',header=T,row.names=1)
+# tcn1 = c(rep(0,150),rep(1,150))
+# test = as.data.frame(t(rbind(t1,status=tcn1)))
+```
+
+## 2 Classification experiments
+
+2.1 Random Forest classification
+```{r Random Forest classification}
+#train the forest with status as target variable
+miRNA.rf = randomForest(as.factor(status) ~ .,data=train,importance=T,proximity=T)
+#list variable importance score for the 109 miRNAs
+miRNA.rf$importance[order(miRNA.rf$importance[,4], decreasing = TRUE),][1:25,]
+# Plot variable importance
+varImpPlot(miRNA.rf, type=2, n.var=25, main='Variable Importance for Top 10 Predictors\n(Mean decrease in Gini node impurity)')
+# Get predictions for training data set
+miRNA.predtrain <- predict(miRNA.rf,type="prob")
+# Get predictions for test data set
+miRNA.predtest <- predict(miRNA.rf,newdata=test,type="prob")
+```
+
+2.2 Calculate and plot ROC and AUC
+```{r Calculate and plot ROC and AUC}
+pred.train = prediction(as.vector(miRNA.predtrain[,2]),as.vector(train[,c('status')]))
+pred.train_auc = performance(pred.train, 'auc')
+pred.train_rates = performance(pred.train, 'tpr','fpr')
+plot(pred.train_rates, main='ROC miRNA Predictors', col='red', lwd=2)
+pred.test = prediction(as.vector(miRNA.predtest[,2]),as.vector(test[,c('status')]))
+pred.test_auc = performance(pred.test, 'auc')
+pred.test_rates = performance(pred.test, 'tpr','fpr')
+plot(pred.test_rates, main='ROC miRNA Predictors', col='blue', lwd=2,add=T)
+text(0.5,0.5,paste('AUC for train = ',format(pred.train_auc@y.values[[1]],digits=2,scientific=FALSE)),col="red")
+text(0.5,0.4,paste('AUC for test = ',format(pred.test_auc@y.values[[1]],digits=2,scientific=FALSE)),col="blue")
+grid()
+```
+
+2.3 Select best n features
+```{r Select best n features}
+n <- 5
+goodPredictors = rownames(miRNA.rf$importance)[order(miRNA.rf$importance[,4],decreasing=T)][1:n]
+```
+
+2.4 Scatter plot of two features
+```{r Scatter plot of two features}
+f1 <- 2;
+f2 <- 4;
+
+matplot(train[train$status==0,goodPredictors[f1]],train[train$status==0,goodPredictors[f2]],
+     main="Scatterplot of two best features",xlab=goodPredictors[f1],ylab=goodPredictors[f2],
+     col='purple',pch=15)
+matplot(train[train$status==1,goodPredictors[f1]],train[train$status==1,goodPredictors[f2]],
+     main="Scatterplot of two best features",xlab=goodPredictors[f1],ylab=goodPredictors[f2],
+     col='orange',pch=16,add=T)
+```
+
+2.5 Nearest neighbor classification 
+```{r Nearest neighbor classification}
+NN.trainpred <- knn(train[,goodPredictors], train[,goodPredictors], cl=train$status, k=3)
+NN.testpred <- knn(train[,goodPredictors], test[,goodPredictors], cl=train$status, k=3)
+#plot train and test error as a function of k
+K <-25
+trainerror = array(0,c(1,K))
+testerror = array(0,c(1,K))
+for(k in 1:K) {
+  trainlabel <- knn(train[,goodPredictors], train[,goodPredictors], cl=train$status, k=k)
+  trainerror[k]<-sum(train$status!=trainlabel)/nrow(train)
+  testlabel <- knn(train[,goodPredictors], test[,goodPredictors], cl=train$status, k=k)
+  testerror[k]<-sum(test$status!=testlabel)/nrow(test)
+}
+matplot(c(1:K),as.vector(trainerror),type='l',main='Train (red) and test (blue) error for Knn classifier', col='red', lwd=2,ylim=c(0,1),xlab = 'Number of neighbors',ylab = 'Classification error')
+matplot(c(1:K),as.vector(testerror),type='l', col='blue', lwd=2,add=T)
+grid()
+```
+
+## 3 Melanoma dataset
+
+3. Load Melanoma dataset
+```{r}
+rm(list=ls())
+load(file = "data/melanoma/melanoma.rda")
+#types of immune cells
+levels(train$immune.label)
+
+# #parse original data and save
+# traindata = as.data.frame(t(as.matrix(read.csv('data/melanoma/nonMalignant.2kgenes.data.learning.csv',header=T,row.names=1))))
+# trainlabel = as.data.frame(read.csv('data/melanoma/nonMalignant.2kgenes.immuneMetadata.learning.csv',header=T,row.names=1))
+# #checking whether the names (labels) are the same
+# sum(rownames(trainlabel)==rownames(traindata))
+# train = as.data.frame(cbind(traindata,trainlabel))
+# View(train[,1999:2002])
+# 
+# testdata = as.data.frame(t(as.matrix(read.csv('data/melanoma/nonMalignant.2kgenes.data.prediction.csv',header=T,row.names=1))))
+# testlabel = as.data.frame(read.csv('data/melanoma/nonMalignant.2kgenes.immuneMetadata.prediction.csv',header=T,row.names=1))
+# #checking whether the names (labels) are the same
+# sum(rownames(testlabel)==rownames(testdata))
+# test = as.data.frame(cbind(testdata,testlabel))
+# View(test[,1999:2002])
+# 
+# save(train, test, file = "data/melanoma/melanoma.rda")
+
+# Run Random Forest model
+melanoma.rf = randomForest(as.factor(immune.label) ~ .,data=train,importance=T,proximity=T,ntree=100)
+melanoma.rf$importance[order(melanoma.rf$importance[,8], decreasing = TRUE),][1:25,]
+melanoma.rf
+varImpPlot(melanoma.rf, type=2, main='Variable Importance for Top 10 Predictors\n(Mean decrease in Gini node impurity)')
+melanoma.predtrain <- predict(melanoma.rf)
+melanoma.predtest <- predict(melanoma.rf,newdata=test)
+```
+
+## 4 Evaluating prediction performance when reducing the number of feature
+
+4. Evaluating prediction performance when reducing the number of features
+```{r Evaluating prediction performance when reducing the number of features}
+N<-c(dim(train)[2]-1,200,100,50,20,10,5,2,1)
+Nl <- length(N)
+
+trainerror = array(0,c(1,Nl))
+testerror = array(0,c(1,Nl))
+
+trainerror[1] = mean(as.vector(melanoma.predtrain)==as.vector(train[,c('immune.label')]))
+testerror[1] = mean(as.vector(melanoma.predtest)==as.vector(test[,c('immune.label')]))
+
+for(k in 2:Nl) {
+  goodPredictors = rownames(melanoma.rf$importance)[order(melanoma.rf$importance[,8],decreasing=T)][1:N[k]]
+  melanoma.rf = randomForest(as.factor(immune.label) ~ .,data=train[,union(goodPredictors,"immune.label")],importance=T,proximity=T,ntree=100)
+  melanoma.predtrain <- predict(melanoma.rf)
+  melanoma.predtest <- predict(melanoma.rf,newdata=test)
+  trainerror[k] = mean(as.vector(melanoma.predtrain)==as.vector(train[,c('immune.label')]))
+  testerror[k] = mean(as.vector(melanoma.predtest)==as.vector(test[,c('immune.label')]))
+  print(k)
+}
+
+matplot(N,as.vector(trainerror),type='l',main='Train (red) and test (blue) error for QDA classifier', col='red', lwd=2,xlim=c(0,200),ylim=c(0,1),xlab = 'Number of selected features',ylab = 'Classification error')
+matplot(N,as.vector(testerror),type='l', col='blue', lwd=2,add=T)
+grid()
+```
+## 5 Cancer Drug Response dataset
+
+5.1 Load Cancer Drug Response dataset
+```{r Load Cancer Drug Response dataset}
+rm(list=ls())
+#drug response of 469 cancer cell lines to Afatinib, Nutlin-3a, PLX-4720, PD-0325901
+drug_response = read.csv('data/drugresponse/DR_DrugResponse.csv',header=T,row.names=1)
+#tissue description
+tissue = read.csv('data/DR_TissueDescription.csv',header=T,row.names=1)
+
+#datasets (the same 1622 genes)
+gene_expression = read.csv('data/drugresponse/DR_GeneExpression.csv',header=T,row.names=1)
+copy_number = read.csv('data/drugresponse/DR_CopyNumber.csv',header=T,row.names=1)
+#in copy number 0=deletion 2=normal(diploid) >2=amplication
+mutation = read.csv('data/drugresponse/DR_Mutation.csv',header=T,row.names=1)
+
+#trainDR = cbind(t(mutation),status = as.numeric(as.factor(drug_response[2,]==1)))
+trainDR = as.data.frame(cbind(t(gene_expression),status = as.numeric(as.factor(drug_response[2,]==1))))
+dim(trainDR)
+```
+
+5.2 Create folds for cross-validation
+```{r}
+folds_3 <- createFolds(trainDR$status, k=3)
+results_3=list() 
+for (cv_fold in folds_3){
+  cv_train <- trainDR[cv_fold,]
+  cv_test <- trainDR[-cv_fold,]
+  dr.rf = randomForest(as.factor(status) ~ .,data=cv_train,importance=T,proximity=T)
+  dr.predtrain <- predict(dr.rf)
+  dr.predtest <- predict(dr.rf,newdata=cv_test)
+  testerror = mean(as.vector(dr.predtest)==as.vector(cv_test[,c('status')]))
+  results_3 = c(results_3,testerror)
+}
+
+avg_3 <- mean(unlist(results_3))
+
+folds_5 <- createFolds(trainDR$status, k=5)
+results_5=list() 
+for (cv_fold in folds_5){
+  cv_train <- trainDR[cv_fold,]
+  cv_test <- trainDR[-cv_fold,]
+  dr.rf = randomForest(as.factor(status) ~ .,data=cv_train,importance=T,proximity=T)
+  dr.predtrain <- predict(dr.rf)
+  dr.predtest <- predict(dr.rf,newdata=cv_test)
+  testerror = mean(as.vector(dr.predtest)==as.vector(cv_test[,c('status')]))
+  results_5 = c(results_5,testerror)
+}
+
+avg_5 <- mean(unlist(results_5))
+
+folds_8 <- createFolds(trainDR$status, k=8)
+results_8=list() 
+for (cv_fold in folds_8){
+  cv_train <- trainDR[cv_fold,]
+  cv_test <- trainDR[-cv_fold,]
+  dr.rf = randomForest(as.factor(status) ~ .,data=cv_train,importance=T,proximity=T)
+  dr.predtrain <- predict(dr.rf)
+  dr.predtest <- predict(dr.rf,newdata=cv_test)
+  testerror = mean(as.vector(dr.predtest)==as.vector(cv_test[,c('status')]))
+  results_8 = c(results_8,testerror)
+}
+
+avg_8 <- mean(unlist(results_8))
+
+folds_10 <- createFolds(trainDR$status, k=10)
+results_10=list() 
+for (cv_fold in folds_10){
+  cv_train <- trainDR[cv_fold,]
+  cv_test <- trainDR[-cv_fold,]
+  dr.rf = randomForest(as.factor(status) ~ .,data=cv_train,importance=T,proximity=T)
+  dr.predtrain <- predict(dr.rf)
+  dr.predtest <- predict(dr.rf,newdata=cv_test)
+  testerror = mean(as.vector(dr.predtest)==as.vector(cv_test[,c('status')]))
+  results_10 = c(results_10,testerror)
+}
+
+avg_10 <- mean(unlist(results_10))
+
+dr.rf$importance[order(dr.rf$importance[,4],decreasing = TRUE),][1:10,]
+varImpPlot(dr.rf, type=2, main='Variable Importance for Top 10 Predictors\n(Mean decrease in Gini node impurity)')
+```
+
+5.3. Compare cross-validation folds
+```{r}
+trainDR_g = as.data.frame(cbind(t(gene_expression),status = as.numeric(as.factor(drug_response[2,]==1))))
+
+folds_3_g <- createFolds(trainDR_g$status, k=3)
+results_3_g=list() 
+for (cv_fold in folds_3){
+  cv_train <- trainDR_g[cv_fold,]
+  cv_test <- trainDR_g[-cv_fold,]
+  dr.rf = randomForest(as.factor(status) ~ .,data=cv_train,importance=T,proximity=T)
+  dr.predtrain <- predict(dr.rf)
+  dr.predtest <- predict(dr.rf,newdata=cv_test)
+  testerror = mean(as.vector(dr.predtest)==as.vector(cv_test[,c('status')]))
+  results_3_g = c(results_3_g,testerror)
+}
+
+avg_3_g <- mean(unlist(results_3_g))
+
+folds_5_g <- createFolds(trainDR_g$status, k=5)
+results_5_g=list() 
+for (cv_fold in folds_5){
+  cv_train <- trainDR_g[cv_fold,]
+  cv_test <- trainDR_g[-cv_fold,]
+  dr.rf = randomForest(as.factor(status) ~ .,data=cv_train,importance=T,proximity=T)
+  dr.predtrain <- predict(dr.rf)
+  dr.predtest <- predict(dr.rf,newdata=cv_test)
+  testerror = mean(as.vector(dr.predtest)==as.vector(cv_test[,c('status')]))
+  results_5_g = c(results_5_g,testerror)
+}
+
+avg_5_g <- mean(unlist(results_5_g))
+
+folds_8_g <- createFolds(trainDR_g$status, k=8)
+results_8_g=list() 
+for (cv_fold in folds_8){
+  cv_train <- trainDR_g[cv_fold,]
+  cv_test <- trainDR_g[-cv_fold,]
+  dr.rf = randomForest(as.factor(status) ~ .,data=cv_train,importance=T,proximity=T)
+  dr.predtrain <- predict(dr.rf)
+  dr.predtest <- predict(dr.rf,newdata=cv_test)
+  testerror = mean(as.vector(dr.predtest)==as.vector(cv_test[,c('status')]))
+  results_8_g = c(results_8_g,testerror)
+}
+
+avg_8_g <- mean(unlist(results_8_g))
+
+folds_10_g <- createFolds(trainDR_g$status, k=10)
+results_10_g=list() 
+for (cv_fold in folds_10_g){
+  cv_train <- trainDR[cv_fold,]
+  cv_test <- trainDR[-cv_fold,]
+  dr.rf = randomForest(as.factor(status) ~ .,data=cv_train,importance=T,proximity=T)
+  dr.predtrain <- predict(dr.rf)
+  dr.predtest <- predict(dr.rf,newdata=cv_test)
+  testerror = mean(as.vector(dr.predtest)==as.vector(cv_test[,c('status')]))
+  results_10_g = c(results_10_g,testerror)
+}
+
+avg_10_g <- mean(unlist(results_10_g))
+
+trainDR_c = as.data.frame(cbind(t(copy_number),status = as.numeric(as.factor(drug_response[2,]==1))))
+
+folds_3_c <- createFolds(trainDR_c$status, k=3)
+results_3_c=list() 
+for (cv_fold in folds_3_c){
+  cv_train <- trainDR[cv_fold,]
+  cv_test <- trainDR[-cv_fold,]
+  dr.rf = randomForest(as.factor(status) ~ .,data=cv_train,importance=T,proximity=T)
+  dr.predtrain <- predict(dr.rf)
+  dr.predtest <- predict(dr.rf,newdata=cv_test)
+  testerror = mean(as.vector(dr.predtest)==as.vector(cv_test[,c('status')]))
+  results_3_c = c(results_3_c,testerror)
+}
+
+avg_3_c <- mean(unlist(results_3_c))
+
+folds_5_c <- createFolds(trainDR_c$status, k=5)
+results_5_c=list() 
+for (cv_fold in folds_5_c){
+  cv_train <- trainDR[cv_fold,]
+  cv_test <- trainDR[-cv_fold,]
+  dr.rf = randomForest(as.factor(status) ~ .,data=cv_train,importance=T,proximity=T)
+  dr.predtrain <- predict(dr.rf)
+  dr.predtest <- predict(dr.rf,newdata=cv_test)
+  testerror = mean(as.vector(dr.predtest)==as.vector(cv_test[,c('status')]))
+  results_5_c = c(results_5_c,testerror)
+}
+
+avg_5_c <- mean(unlist(results_5_c))
+
+folds_8_c <- createFolds(trainDR_c$status, k=8)
+results_8_c=list() 
+for (cv_fold in folds_8_c){
+  cv_train <- trainDR[cv_fold,]
+  cv_test <- trainDR[-cv_fold,]
+  dr.rf = randomForest(as.factor(status) ~ .,data=cv_train,importance=T,proximity=T)
+  dr.predtrain <- predict(dr.rf)
+  dr.predtest <- predict(dr.rf,newdata=cv_test)
+  testerror = mean(as.vector(dr.predtest)==as.vector(cv_test[,c('status')]))
+  results_8_c = c(results_8_c,testerror)
+}
+
+avg_8_c <- mean(unlist(results_8_c))
+
+folds_10_c <- createFolds(trainDR_c$status, k=10)
+results_10_c=list() 
+for (cv_fold in folds_10_c){
+  cv_train <- trainDR[cv_fold,]
+  cv_test <- trainDR[-cv_fold,]
+  dr.rf = randomForest(as.factor(status) ~ .,data=cv_train,importance=T,proximity=T)
+  dr.predtrain <- predict(dr.rf)
+  dr.predtest <- predict(dr.rf,newdata=cv_test)
+  testerror = mean(as.vector(dr.predtest)==as.vector(cv_test[,c('status')]))
+  results_10_c = c(results_10_c,testerror)
+}
+
+avg_10_c <- mean(unlist(results_10_c))
+
+matplot(c(3,5,8,10),c(avg_3,avg_5,avg_8,avg_10),col='turquoise3',type="l",ylim=c(0.825,0.84),xlab = 'Number of cross-validation folds', ylab = 'Performance')
+matplot(c(3,5,8,10),c(avg_3_g,avg_5_g,avg_8_g,avg_10_g),col='tomato1',type="l",add=T)
+matplot(c(3,5,8,10),c(avg_3_c,avg_5_c,avg_8_c,avg_10_c),col='slateblue2',type="l",add=T)
+text(5,0.839,'mutation',col="turquoise3")
+text(5,0.837,'gene expression',col="tomato1")
+text(5,0.835,'copy number',col="slateblue2")
+```
+
+5.4 Dealing with unbalanced classes
+```{r Dealing with unbalanced classes}
+#make smaller dataset trainDR25 with the 25 best features
+n <- 25
+goodPredictors = rownames(dr.rf$importance)[order(dr.rf$importance[,4],decreasing=T)][1:n]
+trainDR25 <- cbind(trainDR[,goodPredictors],status = as.numeric(trainDR$status))
+
+#class weights (classwt) doesn't seem to do much
+#make class weights
+labels = as.numeric(as.factor(drug_response[2,]==1))
+cw = 1-c(sum(labels==1)/length(labels),sum(labels==2)/length(labels))
+cw <- c(1,1e3)
+#run without class weights
+dr.rf = randomForest(as.factor(status) ~ .,data=trainDR25,importance=T,proximity=T)
+dr.rf
+dr.rf = randomForest(as.factor(status) ~ .,data=trainDR25,importance=T,proximity=T,classwt=cw)
+dr.rf
+#use different cut-off helps to shift errors between classes
+dr.rf = randomForest(as.factor(status) ~ .,data=trainDR25,importance=T,proximity=T,cutoff=c(3/4,1/4))
+dr.rf
+#or use stratified sampling as
+sum(trainDR25$status==1)
+mc<-sum(trainDR25$status==2)
+dr.rf = randomForest(as.factor(status) ~ .,data=trainDR25,importance=T,proximity=T,ntree=500,
+                     strata=trainDR25$status, sampsize=c(mc,mc))
+dr.rf
+```
+
+5.5 Comparing different feature sets across the four drugs
+```{r Comparing different feature sets across the four drug}
+#make an object that contains the three feature sets and an concatenation of the three
+mm<-matrix(list(), 1, 4)
+mm[[1,1]]<-t(copy_number)
+mm[[1,2]]<-t(gene_expression)
+mm[[1,3]]<-t(mutation)
+mm[[1,4]]<-cbind(t(copy_number),t(gene_expression),t(mutation))
+
+S <- 4 #number of datasets
+D <- 4 #number of drugs
+performance = vector(length=S*D)
+datasetstr <- vector(mode="character", length=S*D)
+drugstr <- vector(mode="character", length=S*D)
+
+# loop over the four drugs and feature sets and collect the classification performance for each
+# this will take a long time...
+i<-0
+for(s in 1:S) {
+  for(d in 1:D) {
+    i = i + 1
+    train = as.data.frame(cbind(mm[[1,s]],status = as.numeric(as.factor(drug_response[2*d,]==1))))
+    sum(train$status==1)
+    mc<-sum(train$status==2)
+    dr.rf = randomForest(as.factor(status) ~ .,data=train,importance=T,proximity=T,ntree=500,
+                         strata=train$status, sampsize=c(mc,mc))
+    performance[i] <- 1-mean(dr.rf$confusion[,3])
+    if (s==1) {datasetstr[i] = 'CopyNumber'}
+    else if (s==2) {datasetstr[i] = 'GeneExpression'}
+    else if (s==3) {datasetstr[i] = 'Mutation'}
+    else if (s==4) {datasetstr[i] = 'CN+GE+M'}
+    if (d==1) {drugstr[i] = 'Afatinib'}
+    else if (d==2) {drugstr[i] = 'Nutlin3a'}
+    else if (d==3) {drugstr[i] = 'PLX4720'}
+    else if (d==4) {drugstr[i] = 'PD0325901'}
+    print(i)
+  }
+}
+
+#plotting the classification performance
+df <-data.frame(performance,datasetstr,drugstr)
+ggplot(data = df, aes(x = drugstr, y = performance, fill = datasetstr)) +
+  geom_col(position = position_dodge())
+```
+
+5.6 Plotting some correlations
+```{r Plotting some correlations}
+trainDR = as.data.frame(cbind(t(gene_expression),status = as.numeric(as.factor(drug_response[2,]==1))))
+#getting correlations between 
+r<-cor(trainDR,trainDR$status)
+which.max(r)
+r[1623]<-0
+geneofinterest <- colnames(trainDR)[which.max(r)]
+p <- ggplot(trainDR, aes(factor(status), IRF6_expr))
+p + geom_violin(scale = "width") + geom_jitter(height = 0, width = 0.1)
+
+dr.rf = randomForest(as.factor(status) ~ .,data=trainDR,importance=T,proximity=T)
+n <- 10
+goodPredictors = rownames(dr.rf$importance)[order(dr.rf$importance[,4],decreasing=T)][1:n]
+r<-cor(trainDR[,goodPredictors])
+r
+#plot the correlation of a selected feature
+qplot(CDS1_expr, IRF6_expr , data=trainDR, geom=c("point","smooth"))
+
+#actual IC50s vs class labels (binarized IC50s)
+matplot(drug_response[1,],drug_response[2,]+runif(ncol(drug_response))/10,
+        xlab=rownames(drug_response[1,]),
+        ylab=rownames(drug_response[2,]),
+        col='purple',pch=15)
+```
+## 6 TCGA PANCANCER set Gene expression
+
+6. Load TCGA PANCANCER set Gene expression
+```{r Load TCGA PANCANCER set Gene expression}
+rm(list=ls())
+#expression data of the 500 most varying genes amongst 3000+ samples from 12 TCGA tumor types
+expression_data = read.csv('data/TCGA_PANCAN12_expressiondata.tsv',header=T,row.names=1,sep='\t')
+#tissue description
+tumortypes = read.csv('data/TCGA_PANCAN12_tumortypes.tsv',header=T,row.names=1,sep='\t')
+
+#tumor types
+levels(as.factor(t(tumortypes)[,'TumorTypes']))
+
+#create data frame and run RF classifier
+trainTCGA = cbind(t(expression_data ),status = as.numeric(as.factor(t(tumortypes)[,'TumorTypes'])))
+dim(trainTCGA)
+trainTCGA = as.data.frame(trainTCGA)
+dr.rf = randomForest(as.factor(status) ~ .,data=trainTCGA,ntree=10,importance=T,proximity=T)
+dr.rf$importance[order(dr.rf$importance[,14],decreasing=TRUE),][1:10,]
+dr.rf
+varImpPlot(dr.rf, n.var=10,type=2, main='Variable Importance for Top 10 Predictors\n(Mean decrease in Gini node impurity)')
+
+goodPredictors = rownames(dr.rf$importance)[order(dr.rf$importance[,14],decreasing=T)][1:5]
+boxplot(trainTCGA$TRPS1~trainTCGA$status,names=levels(as.factor(t(tumortypes)[,'TumorTypes'])))
+
+#confusion matrix
+dr.rf$confusion
+```
+
