@@ -1,0 +1,358 @@
+---
+title: "Patient Stratification of Breast Invasive Carcinoma (BRCA)"
+output: html_document
+---
+
+Adapted from the course material provided by the Institute for Systems Biology, Seattle, Washington, USA.  
+
+# Introduction
+
+This project uses gene expression data from the Cancer Genome Atlas (TGCA) Pan-Cancer Atlas Consortium.
+
+## 1.1 Load packages and data for analysis
+
+```{r load_packages,  message = FALSE }
+# Load packages for analysis 
+packages <- c(
+  # set of packages for easy manipulation of data (Author: Hadley Wickam http://hadley.nz/)
+  "tidyverse", 
+  "magrittr",
+  "ConsensusClusterPlus",
+  "sigclust", 
+  "cluster",
+  "RColorBrewer", # library for east access to multiple colors for plotting
+  "colorRamps",
+  "pheatmap",
+  "gplots",
+  "survival",
+  "GEOquery",
+  "Rtsne",
+  "knitr"
+)
+
+# Check that all required packages are installed i.e. require("ConsensusClusterPlus") and loaded
+# sapply -- apply a function to all the elements of a vector like object
+sapply(X = packages, FUN = require, character.only = TRUE, quietly=TRUE)
+
+# data directory
+dataDirectory <- "data"
+
+# results directory
+resultsDirectory <- "results"
+
+dataFilePath <- file.path(dataDirectory, "pancan_dataset", "BRCA", "gexp_BRCA_pancan.csv")
+print(dataFilePath)
+
+# load file into environment
+gexp = read.csv(dataFilePath, header=T, row.names=1)  # baseR
+
+```
+
+## 1.2 Exploratory Data Analysis
+
+Perform some standard exploratory data analysis and perform quick quality control checks by viewing the data.
+
+```{r view_top}
+# View snippet of the expression matrix
+gexp[1:10,1:5]
+```
+
+Check that there are no NA values.
+
+```{r check_na}
+print(sum(colSums(is.na(gexp))))
+```
+
+How many samples are in the dataset?
+
+```{r get_matrix_dimensions}
+print(paste0("Number of samples: ", dim(gexp)[[2]]))
+print(paste0("Number of genes: ", dim(gexp)[[1]]))
+```
+
+Visualize the distribution of expression values for each sample by plotting boxplots and density plots to check for outliers and see the overall distribution of the data.
+
+```{r expression_boxplots}
+# Boxplots of expression values to check data normlization
+# Create a random set of n samples
+n <- 50
+gexp_rand_sample <- gexp[,sample(1:dim(gexp)[2], n)]  
+
+# convert data to long format
+# %>% Pipe operator - used to chain commands together
+gexp_long <- gexp_rand_sample %>% 
+  mutate(GeneName=rownames(gexp_rand_sample)) %>% 
+  gather("TGCA_Participant_Barcode", "Expression_Level", 1:dim(gexp_rand_sample)[[2]])
+gexp_long[1:10,]
+
+# Visualize using a boxplot with ggplot
+gexp_long %>% 
+  ggplot(aes(x=TGCA_Participant_Barcode, y=Expression_Level)) + 
+  geom_boxplot() + # create boxplot using ggplot
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) # rotate x-axis label
+```
+```{r expression_density}
+gexp_long %>% 
+  ggplot(aes(x=Expression_Level, color=TGCA_Participant_Barcode)) + 
+  geom_density() +
+  labs(title=paste0("mRNA Expression Distribution in Cohort\n Random Sample (n=", n,  ")"))  +
+  theme(legend.position="none") + 
+  xlim(0,3000)
+```
+Clearly the data is heavily skewed. Perform a log transformation to scale the data, and then median center each gene's expression for use in consensus clustering by subtracting the median expression of each gene (row median) from expression in each sample. This mitigates magnitude differences between genes and sets the median to 0 for all genes.
+
+```{r log_transform}
+# Perform log transform
+gexp_log <- log2(gexp+1)
+
+# Median center data
+gexp_log_centered = sweep(gexp_log,1,apply(gexp_log,1,median,na.rm=T)) 
+
+# Plot new density plot with transformed data
+gexp_log_sample <- log2(gexp_rand_sample + 1)
+gexp_log_centered_sample = sweep(gexp_log_sample,1,apply(gexp_log_sample,1,median,na.rm=T)) 
+
+gexp_log_centered_sample %>% 
+  mutate(GeneName=rownames(gexp_log_centered_sample)) %>% 
+  gather("TGCA_Participant_Barcode", "Expression_Level", 1:dim(gexp_log_centered_sample)[[2]])%>% 
+  ggplot(aes(x=Expression_Level, color=TGCA_Participant_Barcode)) + 
+  geom_density() +
+  labs(title=paste0("mRNA Expression Distribution in Cohort\n Random Sample (n=", n,  ")"))  +
+  theme(legend.position="none")
+```
+
+## 1.3 Create training and testing cohort
+Partition the cohort into a training and testing dataset. 
+
+```{r create_test_set}
+set.seed(10)
+hold_out = sample(colnames(gexp_log_centered), size = 350)
+gexp_testing = gexp_log_centered[,hold_out] # testing cohort
+dim(gexp_testing)
+```
+
+```{r create_training_set}
+gexp_training = gexp_log_centered[,which(!(colnames(gexp_log_centered)%in%hold_out))] # training cohort
+dim(gexp_training)
+```
+## 1.4 Feature Selection
+
+Here, we will use median absolute deviation (MAD) for feature selection.
+
+```{r gene_expr_var}
+# Calculate the MAD for each gene in the training dataset
+mads = apply(gexp_training,1,mad)
+head(mads[order(mads, decreasing = T)])
+tail(mads[order(mads, decreasing = T)])
+
+```
+
+Select the most variable genes.
+```{r select_genes}
+# select top k genes
+top_n <- 2000
+
+# subset matrix -- get the most variable genes (more informative for clustering)
+gexp_training_most_var = gexp_training[order(mads,decreasing=T)[1:top_n],]
+gexp_testing_most_var = gexp_testing[order(mads,decreasing=T)[1:top_n],]
+```
+
+## 1.5 Consensus Clustering to Discover Disease Subtypes 
+
+Apply the function `ConsensusClusterPlus` to carry out consensus clustering for k 2......9.
+
+For this analysis there are many parameter choices but the main ones are the following:
+  - clustering algorithm - clusterAlg 
+    + 'hc' heirarchical (hclust)
+    + 'pam' for paritioning around medoids
+    + 'km' for k-means on data matrix
+    + 'kmdist' for k-means on distance matrices or a function that returns a clustering. 
+  - distance metric - distance
+    + 'pearson': (1 - Pearson correlation)
+    + 'spearman' (1 - Spearman correlation)
+    + 'euclidean'
+    + 'binary'
+    + 'maximum'
+    + 'canberra'
+    + 'minkowski'
+    + custom distance function
+  - linkage - the agglomeration method to be used
+    + ward.D
+    + ward.D2
+    + single
+    + complete
+    + average=UPGMA
+    + mcquitty=WPGMA
+    + median=WPGMC
+    + centroid=UPGMC
+
+```{r consensus_clust}
+#pdf(file.path(resultsDirectory, 'consensusClustering_training_brca.pdf')) # results stored here
+#title='mRNA Expression Clustering of TCGA Breast Cancer Dataset'
+results = ConsensusClusterPlus(as.matrix(gexp_training_most_var), maxK=9, reps=100, pItem=0.8, pFeature=1, clusterAlg="hc", distance="pearson", innerLinkage ="average" , finalLinkage = "average", seed=10)
+#dev.off()
+```
+
+## 1.6 Significance of Subtype Separation 
+
+Next we perform analyses to determine if the discovered clusters are significantly separable using `sigclust`. Sigclust analyzes whether clusters are really there, using the 2-means (k = 2) clustering index as a statistic. It assesses the significance of clustering by simulation from a single null Gaussian distribution. 
+
+```{r pairwise_significance}
+# Calculate pairwise significance of clusters for k clusters using sigclust 
+pairwise_cluster_significance <- function(k, expr_mat, cluster_labels){
+  #oldw <- getOption("warn") # turn off warnings for MLE estimation
+  #options(warn = -1)
+  result_mat <- matrix(nrow = k, ncol = k, dimnames=list(1:k,1:k))
+  corr_mat = cor(as.matrix(expr_mat),method = "pearson", use="pairwise.complete.obs") 
+  
+  for(i in 1:k) {
+    for(j in i:k) {
+      if(!i==j) {
+        tmp1 = names(which(cluster_labels==i)) # samples in cluster i
+        tmp2 = names(which(cluster_labels==j)) # samples in cluster j
+        lab1 = c(rep(1,length(tmp1)),rep(2,length(tmp2))) # label vector
+        
+        # alternatively use correlation matrix in the sigclust function
+        tmp3 = sigclust(corr_mat[c(tmp1,tmp2),c(tmp1,tmp2)],nsim=100,labflag=1,label=lab1, 
+                        icovest = 3)
+        
+        result_mat[i,j] = tmp3@pvalnorm
+      }
+    }
+  }
+  return(result_mat)
+} 
+
+# correlation matrix for samples
+corr_mat = cor(as.matrix(gexp_training_most_var), method = "pearson") # distance metric used for clustering
+dissimilarity <- 1 - corr_mat
+
+# Calculate pairwise significance of clusters for 3 clusters
+k <- 3
+
+# extract consensus clustering results - cluster labels
+clusts = results[[k]]$consensusClass[colnames(gexp_training_most_var)]
+head(clusts) # vector with sample cluster membership for k solution
+
+# Assess signficance of cluster separability
+sigclust_mat_k3 <- pairwise_cluster_significance(k=3, expr_mat=gexp_training_most_var, cluster_labels = clusts)
+sigclust_mat_k3
+
+image(x=1:3, y=1:3, sigclust_mat_k3, zlim=c(0,1), col=colorpanel(256,'blue','black','yellow'), 
+      main='3 clusters', xlab='k', ylab='k')
+
+# Compute silhouette information for 3 clusters
+silhouette_k3 <- silhouette(x=clusts, dist = dissimilarity) # distance metric used in clustering)
+plot(silhouette_k3, col = RColorBrewer::brewer.pal(3, "Set1"), border=NA, main="Silhouette plot of K=3", cex.names = 0.8)
+
+# Repeat assessments for k 4,5
+# Calculate significance of cluster separation for 4 clusters
+k <- 4
+clusts = results[[k]]$consensusClass[colnames(gexp_training_most_var)]
+sigclust_mat_k4 <- pairwise_cluster_significance(k=4, expr_mat=gexp_training_most_var, cluster_labels = clusts)
+
+# Compute silhouette information for 4 clusters
+silhouette_k4 <- silhouette(x=clusts, dist = dissimilarity)
+
+# Calculate significance of cluster separation for 5 clusters
+k <- 5
+clusts = results[[k]]$consensusClass[colnames(gexp_training_most_var)]
+sigclust_mat_k5 <- pairwise_cluster_significance(k=5, expr_mat=gexp_training_most_var, cluster_labels = clusts)
+
+silhouette_k5 <- silhouette(x=clusts, dist = dissimilarity) 
+
+# Summary plot sigclust results
+#pdf(file.path(resultsDirectory, 'training_sigclust.pdf'))
+par(mfrow=c(2,2))
+image(x=1:3,y=1:3, sigclust_mat_k3, zlim=c(0,1),col=colorpanel(256,'blue','black','yellow'),main='3 clusters',xlab='k',ylab='k')
+image(x=1:4,y=1:4, sigclust_mat_k4, zlim=c(0,1),col=colorpanel(256,'blue','black','yellow'),main='4 clusters',xlab='k',ylab='k')
+image(x=1:5,y=1:5,  sigclust_mat_k5, zlim=c(0,1),col=colorpanel(256,'blue','black','yellow'),main='5 clusters',xlab='k',ylab='k')
+image(matrix(data=seq(from=0,to=1,length.out=10),nrow=10,ncol=1),col=colorpanel(256,'blue','black','yellow'),main='Legend',axes=F,xlab='P-Value')
+#axis(1)
+#dev.off()
+
+#pdf(file.path(resultsDirectory, 'training_silhouette.pdf'), width = 8, height = 11)
+par(mfrow=c(3,1))
+plot(silhouette_k3,  col =  RColorBrewer::brewer.pal(3, "Set1"), border=NA, 
+     main="Silhouette plot of K=3", cex.names = 0.8)
+plot(silhouette_k4,  col =  RColorBrewer::brewer.pal(4, "Set1"), border=NA, 
+     main="Silhouette plot of K=4", cex.names = 0.8)
+plot(silhouette_k5,  col =  RColorBrewer::brewer.pal(5, "Set1"), border=NA,
+     main="Silhouette plot of K=5", cex.names = 0.8)
+#dev.off()
+```
+## 1.7 Optimal clustering solution 
+
+What is the optimal cluster solution?
+Choose k clusters according to diagnostic plots
+
+```{r choose_optimalK}
+num_clusters <- 3
+clusts = results[[num_clusters]]$consensusClass[colnames(gexp_training_most_var)]
+
+# Plot expression heatmap for training samples and clustering solution
+most_var_genes <- names(mads[order(mads,decreasing=T)[1:300]])
+meta_df <- as.data.frame(clusts)
+meta_df$clusts <- as.factor(meta_df$clusts)
+names(meta_df) <- c("Consensus Cluster")
+pheatmap::pheatmap(gexp_training_most_var[most_var_genes, names(clusts[order(clusts)])], show_rownames=FALSE, show_colnames=FALSE, 
+                   annotation_col = meta_df,
+                   cluster_rows=TRUE, cluster_cols=FALSE, scale="row", 
+                   color = colorRamps::matlab.like(25), annotation_names_col = F,
+                   main="Top 300 Most Variable Genes\n Training Cohort", 
+                   filename = file.path(resultsDirectory, "heatmap_training_cohort_most_variable_expression_brca.pdf")
+)
+```
+
+
+## 1.8 Test on hold-out cohort
+
+```{r map_new_samples}
+# Create centroids for clustering new samples
+centroids = matrix(nrow=nrow(gexp_training_most_var),ncol=num_clusters,dimnames=list(rownames(gexp_training_most_var),c(1:num_clusters)))
+
+for(clust in 1:num_clusters) {
+  tmp1 = names(which(clusts==clust))
+  centroids[,clust] = apply(gexp_training_most_var[,tmp1],1,median)
+}
+
+head(centroids)
+```
+
+
+To assign testing set samples to a learned cluster, we find the correlation between each sample and the cluster centroids
+
+```{r corr_centroids}
+corr_mat_testing = cor(cbind(centroids, gexp_training_most_var),method='pearson', use= "pairwise.complete.obs")[-c(1:num_clusters),1:num_clusters]
+
+# assign each sample (row) to the nearest centroid (i.e. the one with highest correlation)
+clusts_testing= sapply(1:nrow(corr_mat_testing), function(x) { which(corr_mat_testing[x,]==max(corr_mat_testing[x,])) })
+names(clusts_testing) = rownames(corr_mat_testing)
+head(clusts_testing)
+```
+
+How well are the testing set samples represented in the clustering solution?
+
+```{r }
+# Calculate pairwise significance of clusters for k clusters
+sigclust_testing <- pairwise_cluster_significance(k = num_clusters, expr_mat = gexp_training_most_var, cluster_labels = clusts_testing)
+
+# Compute silhouette information for clustering in 5 clusters
+# correlation matrix for samples
+corr_mat = cor(as.matrix(gexp_training_most_var), method = "pearson") # distance metric used for clustering
+dissimilarity <- 1 - corr_mat
+silhouette_testing <- silhouette(x=clusts_testing, dist = dissimilarity) # distance metric used in clustering)
+
+# Plot significance of separability on hold-out test cohort
+#pdf(file.path(resultsDirectory, 'testing_sigclust_silhouette_lung.pdf'))
+par(mfrow=c(2,2))
+image(x=1:num_clusters,y=1:num_clusters, sigclust_testing, zlim=c(0,1),col=colorpanel(256,'blue','black','yellow'),main=paste0(num_clusters, ' clusters'),xlab='k',ylab='k')
+image(matrix(data=seq(from=0,to=1,length.out=100),nrow=10,ncol=1),col=colorpanel(256,'blue','black','yellow'),main='Legend',axes=F,xlab='P-Value')
+axis(1)
+plot(silhouette_testing,  col =  RColorBrewer::brewer.pal(num_clusters, "Set2"), main="Silhouette Plot of Testing Cohort", border=NA)
+#dev.off()
+
+# Write out the subtype definitions for TCGA discovery and testing cohorts
+write.csv(cbind(names(clusts),clusts),row.names=F, file.path(resultsDirectory, 'tcga_brca_training_clusters.csv'))
+write.csv(cbind(names(clusts_testing),clusts_testing),row.names=F, file.path(resultsDirectory, 'tcga_brca_testing_clusters.csv'))
+```
